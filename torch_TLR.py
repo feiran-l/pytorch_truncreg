@@ -1,163 +1,47 @@
 import numpy as np
 import torch
-import torch.distributions as dist
 import torch.nn as nn
 from torch.optim import Adam
 from tqdm import tqdm
 from time import time
 import pandas as pd
-from scipy.stats import truncnorm
 from py4etrics.truncreg import Truncreg
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.distributions import Distribution, constraints
-from torch.distributions.utils import broadcast_all
-import math
-from numbers import Number
+from scipy.stats import truncnorm
+import torch.distributions as dist
+import gpytorch as gp
 
 
-CONST_SQRT_2 = math.sqrt(2)
-CONST_INV_SQRT_2PI = 1 / math.sqrt(2 * math.pi)
-CONST_INV_SQRT_2 = 1 / math.sqrt(2)
-CONST_LOG_INV_SQRT_2PI = math.log(CONST_INV_SQRT_2PI)
-CONST_LOG_SQRT_2PI_E = 0.5 * math.log(2 * math.pi * math.e)
+class TruncatedNormal:
+    def __init__(self, device='cpu'):
+        self.snd = dist.Normal(torch.tensor(0.0).to(device), torch.tensor(1.0).to(device))
+        self.device = device
 
+    def get_logdelta(self, a, b):
+        res = torch.full_like(a, np.nan, device=self.device)
+        ids1 = torch.logical_and(a <= 30, b >= -30)
+        ids11, ids12 = torch.logical_and(ids1, torch.where(a > 0, 1, 0)), \
+                       torch.logical_and(ids1, torch.where(a <= 0, 1, 0))
+        res[ids11] = self.snd.cdf(-a[ids11]) - self.snd.cdf(-b[ids11])
+        res[ids12] = self.snd.cdf(b[ids12]) - self.snd.cdf(a[ids12])
+        res[~torch.isnan(res)] = torch.max(res[~torch.isnan(res)], torch.zeros_like(res[~torch.isnan(res)]))
+        res[res > 0] = torch.log(res[res > 0])
 
-class TruncatedStandardNormal(Distribution):
-    """
-    Truncated Standard Normal distribution
-    https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf
-    """
+        ids2 = torch.logical_and(torch.where(res <= 0, 1, 0),
+                                 torch.logical_or(b < 0, torch.where(torch.abs(a) >= torch.abs(b), 1, 0)))
+        res[ids2] = gp.log_normal_cdf(-b[ids2]) + torch.log1p(
+            -torch.exp(gp.log_normal_cdf(-a[ids2]) - gp.log_normal_cdf(-b[ids2])))
 
-    arg_constraints = {'a': constraints.real, 'b': constraints.real}
-    support = constraints.real
-    has_rsample = True
+        ids3 = ~ids2
+        res[ids3] = gp.log_normal_cdf(-a[ids3]) + \
+                    torch.log1p(-torch.exp(gp.log_normal_cdf(-b[ids3]) - gp.log_normal_cdf(-a[ids3])))
+        return res
 
-    def __init__(self, a, b, eps=1e-8, validate_args=None):
-        self.a, self.b = broadcast_all(a, b)
-        if isinstance(a, Number) and isinstance(b, Number):
-            batch_shape = torch.Size()
-        else:
-            batch_shape = self.a.size()
-        super(TruncatedStandardNormal, self).__init__(batch_shape, validate_args=validate_args)
-        if self.a.dtype != self.b.dtype:
-            raise ValueError('Truncation bounds types are different')
-        if any((self.a >= self.b).view(-1,).tolist()):
-            raise ValueError('Incorrect truncation range')
-        self._dtype_min_gt_0 = torch.tensor(torch.finfo(self.a.dtype).eps, dtype=self.a.dtype)
-        self._dtype_max_lt_1 = torch.tensor(1 - torch.finfo(self.a.dtype).eps, dtype=self.a.dtype)
-        self._little_phi_a = self._little_phi(self.a)
-        self._little_phi_b = self._little_phi(self.b)
-        self._big_phi_a = self._big_phi(self.a)
-        self._big_phi_b = self._big_phi(self.b)
-        self._Z = (self._big_phi_b - self._big_phi_a).clamp_min(eps)
-        self._log_Z = self._Z.log()
-        self._lpbb_m_lpaa_d_Z = (self._little_phi_b * self.b - self._little_phi_a * self.a) / self._Z
-        self._mean = -(self._little_phi_b - self._little_phi_a) / self._Z
-        self._variance = 1 - self._lpbb_m_lpaa_d_Z - ((self._little_phi_b - self._little_phi_a) / self._Z) ** 2
-        self._entropy = CONST_LOG_SQRT_2PI_E + self._log_Z - 0.5 * self._lpbb_m_lpaa_d_Z
-
-    @property
-    def mean(self):
-        return self._mean
-
-    @property
-    def variance(self):
-        return self._variance
-
-    @property
-    def entropy(self):
-        return self._entropy
-
-    @property
-    def auc(self):
-        return self._Z
-
-    @staticmethod
-    def _little_phi(x):
-        return (-(x ** 2) * 0.5).exp() * CONST_INV_SQRT_2PI
-
-    @staticmethod
-    def _big_phi(x):
-        return 0.5 * (1 + (x * CONST_INV_SQRT_2).erf())
-
-    @staticmethod
-    def _inv_big_phi(x):
-        return CONST_SQRT_2 * (2 * x - 1).erfinv()
-
-    def cdf(self, value):
-        if self._validate_args:
-            self._validate_sample(value)
-        return ((self._big_phi(value) - self._big_phi_a) / self._Z).clamp(0, 1)
-
-    def icdf(self, value):
-        if self._validate_args:
-            self._validate_sample(value)
-        return self._inv_big_phi(self._big_phi_a + value * self._Z)
-
-    def log_prob(self, value):
-        if self._validate_args:
-            self._validate_sample(value)
-        return CONST_LOG_INV_SQRT_2PI - self._log_Z - (value ** 2) * 0.5
-
-    def rsample(self, sample_shape=torch.Size()):
-        shape = self._extended_shape(sample_shape)
-        p = torch.empty(shape).uniform_(self._dtype_min_gt_0, self._dtype_max_lt_1)
-        return self.icdf(p)
-
-    def expand(self, batch_shape, _instance=None):
-        # TODO: it is likely that keeping temporary variables in private attributes violates the logic of this method
-        raise NotImplementedError
-
-
-class TruncatedNormal(TruncatedStandardNormal):
-    """
-    Truncated Normal distribution
-    https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf
-    """
-
-    arg_constraints = {
-        'loc': constraints.real,
-        'scale': constraints.positive,
-        'a': constraints.real,
-        'b': constraints.real}
-    support = constraints.real
-    has_rsample = True
-
-    def __init__(self, loc, scale, a, b, eps=1e-8, validate_args=None):
-        self.loc, self.scale, self.a, self.b = broadcast_all(loc, scale, a, b)
-        a_standard = (a - self.loc) / self.scale
-        b_standard = (b - self.loc) / self.scale
-        super(TruncatedNormal, self).__init__(a_standard, b_standard, eps=eps, validate_args=validate_args)
-        self._log_scale = self.scale.log()
-        self._mean = self._mean * self.scale + self.loc
-        self._variance = self._variance * self.scale ** 2
-        self._entropy += self._log_scale
-
-    def _to_std_rv(self, value):
-        if self._validate_args:
-            self._validate_sample(value)
-        return (value - self.loc) / self.scale
-
-    def _from_std_rv(self, value):
-        if self._validate_args:
-            self._validate_sample(value)
-        return value * self.scale + self.loc
-
-    def cdf(self, value):
-        return super(TruncatedNormal, self).cdf(self._to_std_rv(value))
-
-    def icdf(self, value):
-        if self._validate_args:
-            self._validate_sample(value)
-        return self._from_std_rv(super(TruncatedNormal, self).icdf(value))
-
-    def log_prob(self, value):
-        if self._validate_args:
-            self._validate_sample(value)
-        return super(TruncatedNormal, self).log_prob(self._to_std_rv(value)) - self._log_scale
-
-
-##-------------------------------------------------------------------------------
+    def log_prob(self, val, a, b, loc, scale):
+        val_standard = (val - loc) / scale
+        res = self.snd.log_prob(val_standard) - self.get_logdelta(a, b) - scale.log()
+        res[torch.logical_or(val_standard < a, val_standard > b)] = -np.inf
+        return res
 
 
 class MyTLR(nn.Module):
@@ -170,7 +54,7 @@ class MyTLR(nn.Module):
         if r_thred is not None:
             z[y >= r_thred] = 1
         l_z, mid_z, r_z = torch.where(z == -1, 1, 0), torch.where(z == 0, 1, 0), torch.where(z == 1, 1, 0)
-        l_thred, r_thred = 0 if l_thred is None else l_thred, 0 if r_thred is None else r_thred
+        l_thred, r_thred = -np.inf if l_thred is None else l_thred, 1e2 if r_thred is None else r_thred
         # STEP 2: calculate init beta & sigma with TLS
         self.init_beta, self.init_sigma = [], []
         for yy, XX, zz in zip(y, X, mid_z):
@@ -180,18 +64,24 @@ class MyTLR(nn.Module):
             self.init_beta.append(bb)
             self.init_sigma.append(ss)
         ## STEP 3: transfer to device
-        self.l_z, self.mid_z, self.r_z = l_z.to(device), mid_z.to(device), r_z.to(device)
         self.y, self.X, self.z, self.l_thred, self.r_thred = y.to(device), X.to(device), z.to(device), l_thred, r_thred
         self.beta = nn.Parameter(torch.tensor(self.init_beta).to(device))
         self.sigma = nn.Parameter(torch.tensor(self.init_sigma).to(device))
-        self.snd = dist.Normal(torch.tensor(0.0).to(device), torch.tensor(1.0).to(device))
+        self.truncnorm = TruncatedNormal(device=device)
 
     def forward(self):
         Xb = torch.bmm(self.X, self.beta.unsqueeze(2)).squeeze()
         exp_sigma = torch.exp(self.sigma).view(-1, 1).repeat(1, self.X.shape[1])
         _l, _r = (self.l_thred - Xb) / exp_sigma, (self.r_thred - Xb) / exp_sigma
 
-        log_prob = truncnorm.logpdf(self.y, a=_l, b=_r, loc=Xb, scale=exp_sigma)
+        log_prob = self.truncnorm.log_prob(val=self.y, a=_l, b=_r, loc=Xb, scale=exp_sigma)
+        # tmp = truncnorm.logpdf(self.y.detach().numpy(), a=_l.detach().numpy(), b=_r.detach().numpy(),
+        #                             loc=Xb.detach().numpy(), scale=exp_sigma.detach().numpy())
+        #
+        # if abs(np.linalg.norm(tmp - log_prob.detach().numpy())) / self.y.shape[0] > 1e-5:
+        #     print(abs(np.linalg.norm(tmp - log_prob.detach().numpy())))
+        #     tmp -= log_prob.detach().numpy()
+        #     tmp[np.abs(tmp) <= 1e-5] = 0
 
         return torch.sum(log_prob, dim=-1)
 
@@ -231,14 +121,18 @@ def TLR(data):
 
 if __name__ == '__main__':
 
-    bs, n_lights = 10, 100
+    # np.random.seed(0)
+    # torch.manual_seed(0)
+    # torch.cuda.manual_seed(0)
+
+    bs, n_lights = 2, 100
     y, X = [], []
     for _ in range(bs):
         normal_gt = np.random.rand(3) - 0.5
         normal_gt = normal_gt / np.linalg.norm(normal_gt)
         L = np.random.rand(n_lights, 3)
         L[:, 0], L[:, 1] = L[:, 0] - 0.5, L[:, 1] - 0.5
-        m = L @ normal_gt + np.random.normal(0, 0.1, n_lights)
+        m = L @ normal_gt + np.random.normal(0, 0.01, n_lights)
         m[m < 0] = 0
         y.append(m)
         X.append(L)
@@ -255,7 +149,7 @@ if __name__ == '__main__':
 
     """ pytorch: change the lr according to your data! """
     tic2 = time()
-    torch_res = torch_TLR(y, X, device='cuda:0', lr=1e-1, max_iter=1000, verbose=0)
+    torch_res = torch_TLR(y, X, device='cpu', lr=1e-1, max_iter=1000, verbose=1)
     toc2 = time()
 
     print('\n---------------------------------\n')

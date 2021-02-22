@@ -1,160 +1,97 @@
 import numpy as np
 import torch
-import torch.distributions as dist
-import torch.nn as nn
-from torch.optim import Adam
-from tqdm import tqdm
-from time import time
-import pandas as pd
 from scipy.stats import truncnorm
-from py4etrics.truncreg import Truncreg
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.distributions import Distribution, constraints
-from torch.distributions.utils import broadcast_all
 import math
-from numbers import Number
+from scipy.stats import norm
+import torch.distributions as dist
+import gpytorch as gp
 
 
-CONST_SQRT_2 = math.sqrt(2)
-CONST_INV_SQRT_2PI = 1 / math.sqrt(2 * math.pi)
-CONST_INV_SQRT_2 = 1 / math.sqrt(2)
-CONST_LOG_INV_SQRT_2PI = math.log(CONST_INV_SQRT_2PI)
-CONST_LOG_SQRT_2PI_E = 0.5 * math.log(2 * math.pi * math.e)
 
-
-class TruncatedStandardNormal(Distribution):
-    """
-    Truncated Standard Normal distribution
-    https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf
-    """
-
-    arg_constraints = {'a': constraints.real, 'b': constraints.real}
-    support = constraints.real
-    has_rsample = True
-
-    def __init__(self, a, b, eps=1e-8, validate_args=None):
-        self.a, self.b = broadcast_all(a, b)
-        if isinstance(a, Number) and isinstance(b, Number):
-            batch_shape = torch.Size()
+def get_logdelta(a, b):
+    if (a <= 30) and (b >= -30):
+        if a > 0:
+            delta = norm.cdf(-a) - norm.cdf(-b)
         else:
-            batch_shape = self.a.size()
-        super(TruncatedStandardNormal, self).__init__(batch_shape, validate_args=validate_args)
-        if self.a.dtype != self.b.dtype:
-            raise ValueError('Truncation bounds types are different')
-        if any((self.a >= self.b).view(-1,).tolist()):
-            raise ValueError('Incorrect truncation range')
-        self._dtype_min_gt_0 = torch.tensor(torch.finfo(self.a.dtype).eps, dtype=self.a.dtype)
-        self._dtype_max_lt_1 = torch.tensor(1 - torch.finfo(self.a.dtype).eps, dtype=self.a.dtype)
-        self._little_phi_a = self._little_phi(self.a)
-        self._little_phi_b = self._little_phi(self.b)
-        self._big_phi_a = self._big_phi(self.a)
-        self._big_phi_b = self._big_phi(self.b)
-        self._Z = (self._big_phi_b - self._big_phi_a).clamp_min(eps)
-        self._log_Z = self._Z.log()
-        self._lpbb_m_lpaa_d_Z = (self._little_phi_b * self.b - self._little_phi_a * self.a) / self._Z
-        self._mean = -(self._little_phi_b - self._little_phi_a) / self._Z
-        self._variance = 1 - self._lpbb_m_lpaa_d_Z - ((self._little_phi_b - self._little_phi_a) / self._Z) ** 2
-        self._entropy = CONST_LOG_SQRT_2PI_E + self._log_Z - 0.5 * self._lpbb_m_lpaa_d_Z
-
-    @property
-    def mean(self):
-        return self._mean
-
-    @property
-    def variance(self):
-        return self._variance
-
-    @property
-    def entropy(self):
-        return self._entropy
-
-    @property
-    def auc(self):
-        return self._Z
-
-    @staticmethod
-    def _little_phi(x):
-        return (-(x ** 2) * 0.5).exp() * CONST_INV_SQRT_2PI
-
-    @staticmethod
-    def _big_phi(x):
-        return 0.5 * (1 + (x * CONST_INV_SQRT_2).erf())
-
-    @staticmethod
-    def _inv_big_phi(x):
-        return CONST_SQRT_2 * (2 * x - 1).erfinv()
-
-    def cdf(self, value):
-        if self._validate_args:
-            self._validate_sample(value)
-        return ((self._big_phi(value) - self._big_phi_a) / self._Z).clamp(0, 1)
-
-    def icdf(self, value):
-        if self._validate_args:
-            self._validate_sample(value)
-        return self._inv_big_phi(self._big_phi_a + value * self._Z)
-
-    def log_prob(self, value):
-        if self._validate_args:
-            self._validate_sample(value)
-        return CONST_LOG_INV_SQRT_2PI - self._log_Z - (value ** 2) * 0.5
-
-    def rsample(self, sample_shape=torch.Size()):
-        shape = self._extended_shape(sample_shape)
-        p = torch.empty(shape).uniform_(self._dtype_min_gt_0, self._dtype_max_lt_1)
-        return self.icdf(p)
-
-    def expand(self, batch_shape, _instance=None):
-        # TODO: it is likely that keeping temporary variables in private attributes violates the logic of this method
-        raise NotImplementedError
+            delta = norm.cdf(b) - norm.cdf(a)
+        delta = max(delta, 0)
+        if delta > 0:
+            return np.log(delta)
+    if b < 0 or (np.abs(a) >= np.abs(b)):
+        nla, nlb = norm.logcdf(-a), norm.logcdf(-b)
+        logdelta = nlb + np.log1p(-np.exp(nla - nlb))
+    else:
+        sla, slb = norm.logcdf(-a), norm.logcdf(-b)
+        logdelta = sla + np.log1p(-np.exp(slb - sla))
+    return logdelta
 
 
-class TruncatedNormal(TruncatedStandardNormal):
-    """
-    Truncated Normal distribution
-    https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf
-    """
+def logpdf_scalar(x, a, b, scale):
+    if x < a or x > b:
+        return -np.inf
+    shp = np.shape(x)
+    x = np.atleast_1d(x)
+    out = np.full_like(x, np.nan, dtype=np.double)
+    condlta, condgtb = (x < a), (x > b)
+    if np.any(condlta):
+        np.place(out, condlta, -np.inf)
+    if np.any(condgtb):
+        np.place(out, condgtb, -np.inf)
+    cond_inner = ~condlta & ~condgtb
+    if np.any(cond_inner):
+        _logdelta = get_logdelta(a, b)
+        np.place(out, cond_inner, norm.logpdf(x[cond_inner]) - _logdelta)
+    res = out[0] if (shp == ()) else out
+    return res - np.log(scale)
 
-    arg_constraints = {
-        'loc': constraints.real,
-        'scale': constraints.positive,
-        'a': constraints.real,
-        'b': constraints.real}
-    support = constraints.real
-    has_rsample = True
 
-    def __init__(self, loc, scale, a, b, eps=1e-8, validate_args=None):
-        self.loc, self.scale, self.a, self.b = broadcast_all(loc, scale, a, b)
-        a_standard = (a - self.loc) / self.scale
-        b_standard = (b - self.loc) / self.scale
-        super(TruncatedNormal, self).__init__(a_standard, b_standard, eps=eps, validate_args=validate_args)
-        self._log_scale = self.scale.log()
-        self._mean = self._mean * self.scale + self.loc
-        self._variance = self._variance * self.scale ** 2
-        self._entropy += self._log_scale
+def my_logpdf(val, loc, scale, a=None, b=None):
+    _val = (val - loc) / scale
+    res = []
+    for _x, _a, _b, _s in zip(_val.flatten(), a.flatten(), b.flatten(), scale.flatten()):
+        res.append(logpdf_scalar(_x, _a, _b, _s))
+    return np.asarray(res).reshape(scale.shape)
 
-    def _to_std_rv(self, value):
-        if self._validate_args:
-            self._validate_sample(value)
-        return (value - self.loc) / self.scale
 
-    def _from_std_rv(self, value):
-        if self._validate_args:
-            self._validate_sample(value)
-        return value * self.scale + self.loc
+class TruncatedNormal:
+    def __init__(self, device='cpu', eps=1e-20):
+        self.eps = eps
+        self.INV_SQRT_2PI, self.INV_SQRT_2 = 1 / math.sqrt(2 * math.pi), 1 / math.sqrt(2)
+        self.snd = dist.Normal(torch.tensor(0.0).to(device), torch.tensor(1.0).to(device))
 
-    def cdf(self, value):
-        return super(TruncatedNormal, self).cdf(self._to_std_rv(value))
+    def get_logdelta(self, a, b):
+        res = torch.full_like(a, np.nan)
+        ids1 = torch.logical_and(a <= 30, b >= -30)
+        ids11, ids12 = torch.logical_and(ids1, torch.where(a > 0, 1, 0)), \
+                       torch.logical_and(ids1, torch.where(a <= 0, 1, 0))
+        res[ids11] = self.snd.cdf(-a[ids11]) - self.snd.cdf(-b[ids11])
+        res[ids12] = self.snd.cdf(b[ids12]) - self.snd.cdf(a[ids12])
+        res[~torch.isnan(res)] = torch.max(res[~torch.isnan(res)], torch.zeros_like(res[~torch.isnan(res)]))
+        res[res > 0] = torch.log(res[res > 0])
 
-    def icdf(self, value):
-        if self._validate_args:
-            self._validate_sample(value)
-        return self._from_std_rv(super(TruncatedNormal, self).icdf(value))
+        ids2 = torch.logical_and(torch.where(res <= 0, 1, 0),
+                                 torch.logical_or(b < 0, torch.where(torch.abs(a) >= torch.abs(b), 1, 0)))
+        res[ids2] = gp.log_normal_cdf(-b[ids2]) + torch.log1p(
+            -torch.exp(gp.log_normal_cdf(-a[ids2]) - gp.log_normal_cdf(-b[ids2])))
 
-    def log_prob(self, value):
-        if self._validate_args:
-            self._validate_sample(value)
-        return super(TruncatedNormal, self).log_prob(self._to_std_rv(value)) - self._log_scale
+        ids3 = ~ids2
+        res[ids3] = gp.log_normal_cdf(-a[ids3]) + \
+                    torch.log1p(-torch.exp(gp.log_normal_cdf(-b[ids3]) - gp.log_normal_cdf(-a[ids3])))
+        return res
+
+    def log_prob(self, val, a, b, loc, scale):
+        # Phi_a, Phi_b = self.snd.cdf(a), self.snd.cdf(b)
+        # log_delta = (Phi_b - Phi_a).clamp_min(self.eps).log()
+        # print(self.get_logdelta(a, b))
+        # print(log_delta)
+        # print(torch.norm(log_delta - self.get_logdelta(a, b)))
+        val_standard = (val - loc) / scale
+        res = self.snd.log_prob(val_standard) - self.get_logdelta(a, b) - scale.log()
+        res[torch.logical_or(val_standard < a, val_standard > b)] = -np.inf
+        return res
+
+
+
 
 
 ##------------------------------------------------------------------------------------
@@ -162,24 +99,44 @@ class TruncatedNormal(TruncatedStandardNormal):
 
 if __name__ == '__main__':
 
-    # a, b, scale = 0.0, 1.0, 2.0
-    # loc = torch.rand(2, 3) + 2
-    # val = torch.rand(2, 3)
+
+
+    a = 0.1 * np.ones((2, 3))
+    b = np.random.rand(2, 3) + 1.23434
+    loc = np.random.rand(2, 3) + 1
+    val = np.random.rand(2, 3) + 2
+    scale = np.random.rand(2, 3) + 1
+    # scale = np.ones((2, 3))
+
+    res1 = TruncatedNormal().log_prob(val=torch.tensor(val), loc=torch.tensor(loc), scale=torch.tensor(scale),
+                                      a=torch.tensor(a), b=torch.tensor(b)).numpy()
+
+    res2 = my_logpdf(val=val, loc=loc, scale=scale, a=a, b=b)
+    res3 = truncnorm.logpdf(x=val, loc=loc, scale=scale, a=a, b=b)
+
+    print('\n-----------------------------\n')
+    print(res1)
+    print(res2)
+    print(np.linalg.norm(res1 - res2), np.linalg.norm(res1 - res3), np.linalg.norm(res3 - res2))
+
+
+
+
+    # a = np.random.rand(10)
+    # b = np.random.rand(10)
     #
-    # tn_pt = TruncatedNormal(loc, scale, a, b)
-    # alpha, beta = (a - loc) / scale, (b - loc) / scale
+    # print('a is', a)
+    # print('b is', b)
     #
-    # res1 = TruncatedNormal(loc, scale, a, b).log_prob(val)
-    # res1 = np.asarray(res1)
-    # res2 = truncnorm.logpdf(val.numpy(), alpha.numpy(), beta.numpy(), loc=loc.numpy(), scale=scale)
+    # res1 = np.asarray([get_logdelta(x ,y) for (x, y) in zip(a, b)])
+    # print('should be', res1)
     #
-    # print('\n-----------------------------\n')
+    # print('-----------------------------')
+    #
+    # res2 = my_get_logdelta(torch.as_tensor(a), torch.as_tensor(b)).numpy()
+    #
+    # print(res2)
+    #
     # print(np.linalg.norm(res1 - res2))
 
-    loc = np.random.rand(2, 3)
-    val = np.random.rand(2, 3)
 
-    a = np.random.rand(2, 3)
-
-    res1 = truncnorm.logpdf(val, a=val-1, b=val+1, loc=loc, scale=1)
-    print(res1)
