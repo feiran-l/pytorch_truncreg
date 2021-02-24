@@ -5,24 +5,12 @@ import torch.nn as nn
 from torch.optim import Adam
 from tqdm import tqdm
 import gpytorch as gp
-from time import time
-import pandas as pd
-from py4etrics.tobit import Tobit
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 
-
-def tobit(data):
-    formula = 'm ~ L0 + L1 + L2 - 1'  # -1 is for removing the intercept
-    censor = data['m'].apply(lambda x: -1 if x == 0 else 0)
-    tobit_res = Tobit.from_formula(formula, cens=censor, left=0, data=data).fit(method='cg')
-    tobit_res = tobit_res.params[:-1]
-    return tobit_res
-
-
-class MyTobit(nn.Module):
+class Tobit(nn.Module):
     def __init__(self, y, X, device, l_thred=None, r_thred=None):
-        super(MyTobit, self).__init__()
+        super(Tobit, self).__init__()
         ## STEP 1: create the indicator
         z = torch.zeros(y.shape)
         if l_thred is not None:
@@ -56,12 +44,12 @@ class MyTobit(nn.Module):
 
 
 def torch_tobit(y, X, device='cuda:0', lr=1e-1, max_iter=1000, tol=1e-5, verbose=-1):
-    y, X = torch.tensor(y), torch.tensor(X)
-    solver = MyTobit(y=y, X=X, device=device, l_thred=0)
+    y, X = torch.as_tensor(y), torch.as_tensor(X)
+    solver = Tobit(y=y, X=X, device=device, l_thred=0)
     optimizer = Adam(solver.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, max_iter, eta_min=1e-3)
     best_beta, best_loss, prev_loss = None, float('inf'), float('inf')
-    for _ in tqdm(range(max_iter)):
+    for iteration in tqdm(range(max_iter)):
         optimizer.zero_grad()
         loss = -1 * solver().sum() / y.shape[0]
         loss.backward()
@@ -73,8 +61,8 @@ def torch_tobit(y, X, device='cuda:0', lr=1e-1, max_iter=1000, tol=1e-5, verbose
             break
         else:
             prev_loss = loss.item()
-        if verbose > 0:
-            print('curr loss val is:', loss.item())
+    if verbose > 0:
+        print('Converged in {} iterations.'.format(iteration))
     return best_beta
 
 
@@ -85,37 +73,19 @@ def torch_tobit(y, X, device='cuda:0', lr=1e-1, max_iter=1000, tol=1e-5, verbose
 if __name__ == '__main__':
 
 
-    bs, n_lights = 10, 100
-    y, X = [], []
-    for _ in range(bs):
-        normal_gt = np.random.rand(3) - 0.5
-        normal_gt = normal_gt / np.linalg.norm(normal_gt)
-        L = np.random.rand(n_lights, 3)
-        L[:, 0], L[:, 1] = L[:, 0] - 0.5, L[:, 1] - 0.5
-        m = L @ normal_gt + np.random.normal(0, 0.1, n_lights)
-        m[m < 0] = 0
-        y.append(m)
-        X.append(L)
-    y, X = np.asarray(y), np.asarray(X)
+    """ generate synthetic data """
+    batch_size, num_data, dim_data = 10000, 100, 3
+    X = np.random.rand(batch_size, num_data, dim_data) - 0.5
+    beta_gt = np.random.rand(batch_size, 3)
+    y = np.einsum('ijk, ik->ij', X, beta_gt) + np.random.normal(0, 0.1, num_data)
 
-    """ statsmodel """
-    tic1 = time()
-    stats_res = []
-    for i in range(y.shape[0]):
-        data = pd.DataFrame({'m': y[i], 'L0': X[i, :, 0], 'L1': X[i, :, 1], 'L2': X[i, :, 2]})
-        stats_res.append(tobit(data))
-    stats_res = np.asarray(stats_res)
-    toc1 = time()
+    l_thred, r_thred = 0, None
+    if l_thred is not None:
+        y[y < l_thred] = l_thred
+    if r_thred is not None:
+        y[y > r_thred] = r_thred
 
-    """ pytorch: change the lr according to your data! """
-    tic2 = time()
-    torch_res = torch_tobit(y, X, device='cuda:0', lr=1e-1, max_iter=1000, verbose=0)
-    toc2 = time()
-
-    print('\n---------------------------------\n')
-    print('torch err is', np.linalg.norm(normal_gt - torch_res))
-    print('stats err is', np.linalg.norm(normal_gt - stats_res))
-    print('stats-torch difference:', np.linalg.norm(stats_res - torch_res))
-    print('stats time is {},  torch time is {}'.format(toc1 - tic1, toc2 - tic2))
+    """ solve the batched censored regression problem """
+    res = torch_tobit(y, X, device='cuda:0', verbose=1)
 
 

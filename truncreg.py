@@ -74,7 +74,7 @@ def test_n_lights():
 
 
 def test_variance():
-    variances = np.arange(0.001, 0.01, 0.002)
+    variances = [0.01] # np.arange(0.001, 0.01, 0.002)
     n_lights = 100
     normal_gt = np.random.rand(3) - 0.5
     normal_gt = normal_gt / np.linalg.norm(normal_gt)
@@ -97,25 +97,25 @@ def test_variance():
 
 
 if __name__ == '__main__':
-    np.random.seed(0)
+    # np.random.seed(0)
 
-    # """ test variance """
-    # inds, res = test_variance()
-    # inds = ['{:.1f}'.format(x) for x in inds]
-    #
-    # fontsize, bar_width = 20, 0.2
-    # x = np.arange(len(inds))
-    # fig, ax = plt.subplots(figsize=(8, 6))
-    # rects1 = ax.bar(x - bar_width, res[:, 0], bar_width, label='Trunc-OLS')
-    # rects2 = ax.bar(x, res[:, 1], bar_width, label='Censored-MLE')
-    # rects4 = ax.bar(x + bar_width, res[:, 2], bar_width, label='Trunc-MLE')
-    # plt.legend(loc='upper right', fontsize=fontsize - 4)
-    # ax.set_ylabel('Ang. err', fontsize=fontsize)
-    # ax.set_xlabel('Variance', fontsize=fontsize)
-    # plt.xticks(np.arange(len(inds)), inds, fontsize=fontsize - 4)
-    # plt.yticks(fontsize=fontsize - 4)
-    # plt.tight_layout()
-    # plt.show()
+    """ test variance """
+    inds, res = test_variance()
+    inds = ['{:.1f}'.format(x) for x in inds]
+
+    fontsize, bar_width = 20, 0.2
+    x = np.arange(len(inds))
+    fig, ax = plt.subplots(figsize=(8, 6))
+    rects1 = ax.bar(x - bar_width, res[:, 0], bar_width, label='Trunc-OLS')
+    rects2 = ax.bar(x, res[:, 1], bar_width, label='Censored-MLE')
+    rects4 = ax.bar(x + bar_width, res[:, 2], bar_width, label='Trunc-MLE')
+    plt.legend(loc='upper right', fontsize=fontsize - 4)
+    ax.set_ylabel('Ang. err', fontsize=fontsize)
+    ax.set_xlabel('Variance', fontsize=fontsize)
+    plt.xticks(np.arange(len(inds)), inds, fontsize=fontsize - 4)
+    plt.yticks(fontsize=fontsize - 4)
+    plt.tight_layout()
+    plt.show()
 
     """ test num_lights """
     # inds, res = test_n_lights()

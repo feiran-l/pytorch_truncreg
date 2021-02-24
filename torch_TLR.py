@@ -3,17 +3,13 @@ import torch
 import torch.nn as nn
 from torch.optim import Adam
 from tqdm import tqdm
-from time import time
-import pandas as pd
-from py4etrics.truncreg import Truncreg
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from scipy.stats import truncnorm
 import torch.distributions as dist
 import gpytorch as gp
 
 
 class TruncatedNormal:
-    def __init__(self, device='cpu'):
+    def __init__(self, device='cuda:0'):
         self.snd = dist.Normal(torch.tensor(0.0).to(device), torch.tensor(1.0).to(device))
         self.device = device
 
@@ -44,9 +40,9 @@ class TruncatedNormal:
         return res
 
 
-class MyTLR(nn.Module):
+class TLR(nn.Module):
     def __init__(self, y, X, device, l_thred=None, r_thred=None):
-        super(MyTLR, self).__init__()
+        super(TLR, self).__init__()
         ## STEP 1: create the indicator
         z = torch.zeros(y.shape)
         if l_thred is not None:
@@ -73,26 +69,17 @@ class MyTLR(nn.Module):
         Xb = torch.bmm(self.X, self.beta.unsqueeze(2)).squeeze()
         exp_sigma = torch.exp(self.sigma).view(-1, 1).repeat(1, self.X.shape[1])
         _l, _r = (self.l_thred - Xb) / exp_sigma, (self.r_thred - Xb) / exp_sigma
-
         log_prob = self.truncnorm.log_prob(val=self.y, a=_l, b=_r, loc=Xb, scale=exp_sigma)
-        # tmp = truncnorm.logpdf(self.y.detach().numpy(), a=_l.detach().numpy(), b=_r.detach().numpy(),
-        #                             loc=Xb.detach().numpy(), scale=exp_sigma.detach().numpy())
-        #
-        # if abs(np.linalg.norm(tmp - log_prob.detach().numpy())) / self.y.shape[0] > 1e-5:
-        #     print(abs(np.linalg.norm(tmp - log_prob.detach().numpy())))
-        #     tmp -= log_prob.detach().numpy()
-        #     tmp[np.abs(tmp) <= 1e-5] = 0
-
         return torch.sum(log_prob, dim=-1)
 
 
 def torch_TLR(y, X, device='cuda:0', lr=1e-1, max_iter=1000, tol=1e-5, verbose=-1):
-    y, X = torch.tensor(y), torch.tensor(X)
-    solver = MyTLR(y=y, X=X, device=device, l_thred=0)
+    y, X = torch.as_tensor(y), torch.as_tensor(X)
+    solver = TLR(y=y, X=X, device=device, l_thred=0)
     optimizer = Adam(solver.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, max_iter, eta_min=1e-3)
     best_beta, best_loss, prev_loss = None, float('inf'), float('inf')
-    for _ in tqdm(range(max_iter)):
+    for iteration in tqdm(range(max_iter)):
         optimizer.zero_grad()
         loss = -1 * solver().sum() / y.shape[0]
         loss.backward()
@@ -104,16 +91,9 @@ def torch_TLR(y, X, device='cuda:0', lr=1e-1, max_iter=1000, tol=1e-5, verbose=-
             break
         else:
             prev_loss = loss.item()
-        if verbose > 0:
-            print('curr loss val is:', loss.item())
+    if verbose > 0:
+        print('Converged in {} iterations.'.format(iteration))
     return best_beta
-
-
-def TLR(data):
-    formula = 'm ~ L0 + L1 + L2 - 1'  # -1 is for removing the intercept
-    trunc_res = Truncreg.from_formula(formula, left=0, data=data.query('m > 0')).fit(method='cg')
-    trunc_res = trunc_res.params[:-1]
-    return trunc_res
 
 
 ##--------------------------------------------------------------------------------
@@ -121,10 +101,10 @@ def TLR(data):
 
 if __name__ == '__main__':
 
-    # np.random.seed(0)
-    # torch.manual_seed(0)
-    # torch.cuda.manual_seed(0)
-
+    """ 
+    generate synthetic data, all data should be of the same size. 
+    Dummy data (smaller than l_thred or greater than r_thred) can be added to acheive so 
+    """
     bs, n_lights = 2, 100
     y, X = [], []
     for _ in range(bs):
@@ -138,24 +118,5 @@ if __name__ == '__main__':
         X.append(L)
     y, X = np.asarray(y), np.asarray(X)
 
-    """ statsmodel """
-    tic1 = time()
-    stats_res = []
-    for i in range(y.shape[0]):
-        data = pd.DataFrame({'m': y[i], 'L0': X[i, :, 0], 'L1': X[i, :, 1], 'L2': X[i, :, 2]})
-        stats_res.append(TLR(data))
-    stats_res = np.asarray(stats_res)
-    toc1 = time()
-
-    """ pytorch: change the lr according to your data! """
-    tic2 = time()
+    """ solve the batched censored regression problem """
     torch_res = torch_TLR(y, X, device='cpu', lr=1e-1, max_iter=1000, verbose=1)
-    toc2 = time()
-
-    print('\n---------------------------------\n')
-    print('torch err is', np.linalg.norm(normal_gt - torch_res))
-    print('stats err is', np.linalg.norm(normal_gt - stats_res))
-    print('stats-torch difference:', np.linalg.norm(stats_res - torch_res))
-    print('stats time is {},  torch time is {}'.format(toc1 - tic1, toc2 - tic2))
-
-
