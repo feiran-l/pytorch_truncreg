@@ -1,4 +1,4 @@
-# Pytorch_truncreg
+# Pytorch Tobit & Truncated Linear Regression
 
 This is a pytorch-based implementation of censored and truncated linear regression on batched data.
 
