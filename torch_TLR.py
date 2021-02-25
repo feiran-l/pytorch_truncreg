@@ -102,8 +102,7 @@ def torch_TLR(y, X, device='cuda:0', lr=1e-1, max_iter=1000, tol=1e-5, verbose=-
 if __name__ == '__main__':
 
     """ 
-    generate synthetic data, all data should be of the same size. 
-    Dummy data (smaller than l_thred or greater than r_thred) can be added to acheive so 
+    generate synthetic data
     """
     bs, n_lights = 2, 100
     y, X = [], []
