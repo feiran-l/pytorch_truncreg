@@ -1,6 +1,6 @@
 # Pytorch Tobit & Truncated Linear Regression
 
-This is a pytorch-based implementation of censored and truncated linear regression on batched data.
+This is a pytorch-based implementation of censored regression (tobit regression) and truncated regression on batched data.
 
 The speed would be significantly faster than using for-loops on cpu when the batch-size is large.
 
